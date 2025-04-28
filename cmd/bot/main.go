@@ -4,83 +4,93 @@ import (
 	"log"
 	"os"
 
-	"postavkinBot/internal/storage" // подключаем наше хранилище
+	"postavkinBot/internal/bot"
+	"postavkinBot/internal/storage"
+	"postavkinBot/internal/wb"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/joho/godotenv"
 )
 
+// Глобальный канал апдейтов
+var updatesChan = make(chan tgbotapi.Update)
+
 func main() {
-	// Загружаем .env файл
+	// Загружаем .env
 	err := godotenv.Load()
 	if err != nil {
 		log.Fatal("Ошибка загрузки .env файла")
 	}
 
-	// Получаем токен бота из переменной окружения
+	// Инициализация токена бота
 	botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
 	if botToken == "" {
 		log.Fatal("TELEGRAM_BOT_TOKEN не установлен")
 	}
 
 	// Инициализация бота
-	bot, err := tgbotapi.NewBotAPI(botToken)
+	tgBot, err := tgbotapi.NewBotAPI(botToken)
 	if err != nil {
 		log.Panic(err)
 	}
+	tgBot.Debug = true
 
-	bot.Debug = true // Для дебага
+	log.Printf("Бот запущен как: %s", tgBot.Self.UserName)
 
-	log.Printf("Бот запущен как: %s", bot.Self.UserName)
-
-	// Подключение к базе данных
-	dbPath := "data.db" // Имя файла базы данных
-	storage, err := storage.NewStorage(dbPath)
+	// Инициализация БД
+	dbPath := "data.db"
+	storageInstance, err := storage.NewStorage(dbPath)
 	if err != nil {
 		log.Fatalf("Ошибка подключения к базе данных: %v", err)
 	}
 
+	// Инициализация WB клиента
+	wbClient := wb.NewClient()
+
+	// Связываем пакеты bot -> storage и wb
+	bot.Storage = storageInstance
+	bot.WbClient = wbClient
+	bot.UpdatesChan = updatesChan // << добавляем канал апдейтов в пакет bot
+
+	// Старт планировщика
+	bot.StartCronJob(tgBot)
+
+	// Получение апдейтов
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
+	updates := tgBot.GetUpdatesChan(u)
 
-	updates := bot.GetUpdatesChan(u)
-
-	for update := range updates {
-		if update.Message != nil {
-			switch update.Message.Command() {
-			case "start":
-				handleStart(bot, update, storage)
-			case "help":
-				msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Доступные команды:\n/start - Начало работы\n/help - Помощь")
-				bot.Send(msg)
-			default:
-				msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Неизвестная команда. Введите /help для списка доступных команд.")
-				bot.Send(msg)
-			}
+	// Параллельно закидываем апдейты в канал
+	go func() {
+		for update := range updates {
+			updatesChan <- update
 		}
-	}
-}
+	}()
 
-func handleStart(bot *tgbotapi.BotAPI, update tgbotapi.Update, storage *storage.Storage) {
-	telegramID := update.Message.From.ID
-	username := update.Message.From.UserName
-
-	exists, err := storage.UserExists(int64(telegramID))
-	if err != nil {
-		log.Printf("Ошибка проверки пользователя: %v", err)
-		return
-	}
-
-	if !exists {
-		err := storage.CreateUser(int64(telegramID), username)
-		if err != nil {
-			log.Printf("Ошибка создания пользователя: %v", err)
-			return
+	// Обработка апдейтов
+	for update := range updatesChan {
+		if update.Message == nil {
+			continue
 		}
-		msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Вы зарегистрированы! 🎉 Добро пожаловать!")
-		bot.Send(msg)
-	} else {
-		msg := tgbotapi.NewMessage(update.Message.Chat.ID, "С возвращением! 👋")
-		bot.Send(msg)
+
+		switch update.Message.Command() {
+		case "start":
+			bot.HandleStart(tgBot, update)
+		case "help":
+			bot.HandleHelp(tgBot, update)
+		case "warehouses":
+			bot.HandleWarehouses(tgBot, update)
+		case "addwarehouse":
+			bot.HandleAddWarehouse(tgBot, update)
+		case "mywarehouses":
+			bot.HandleMyWarehouses(tgBot, update)
+		case "removewarehouse":
+			bot.HandleRemoveWarehouse(tgBot, update)
+		case "setinterval":
+			bot.HandleSetInterval(tgBot, update)
+		default:
+			msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Неизвестная команда. Введите /help для списка доступных команд.")
+			tgBot.Send(msg)
+		}
 	}
 }
